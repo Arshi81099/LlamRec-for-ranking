@@ -1,181 +1,175 @@
-from .base import AbstractDataloader
-
-import os
 import torch
-import random
-import pickle
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 import numpy as np
-import torch.utils.data as data_utils
 
 
-def worker_init_fn(worker_id):
-    random.seed(np.random.get_state()[1][0] + worker_id)                                                      
-    np.random.seed(np.random.get_state()[1][0] + worker_id)
-
-
-class LRUDataloader():
-    def __init__(self, args, dataset):
+class LRURec(nn.Module):
+    def __init__(self, args):
+        super().__init__()
         self.args = args
-        self.rng = np.random
-        self.save_folder = dataset._get_preprocessed_folder_path()
-        dataset = dataset.load_dataset()
-        self.train = dataset['train']
-        self.val = dataset['val']
-        self.test = dataset['test']
-        self.umap = dataset['umap']
-        self.smap = dataset['smap']
-        self.user_count = len(self.umap)
-        self.item_count = len(self.smap)
+        self.embedding = LRUEmbedding(self.args)
+        self.model = LRUModel(self.args)
+        self.truncated_normal_init()
 
-        args.num_users = self.user_count
-        args.num_items = self.item_count
-        self.max_len = args.bert_max_len
-        self.sliding_size = args.sliding_window_size
+    def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
+        with torch.no_grad():
+            l = (1. + math.erf(((lower - mean) / std) / math.sqrt(2.))) / 2.
+            u = (1. + math.erf(((upper - mean) / std) / math.sqrt(2.))) / 2.
 
-    @classmethod
-    def code(cls):
-        return 'lru'
+            for n, p in self.named_parameters():
+                if not 'layer_norm' in n and 'params_log' not in n:
+                    if torch.is_complex(p):
+                        p.real.uniform_(2 * l - 1, 2 * u - 1)
+                        p.imag.uniform_(2 * l - 1, 2 * u - 1)
+                        p.real.erfinv_()
+                        p.imag.erfinv_()
+                        p.real.mul_(std * math.sqrt(2.))
+                        p.imag.mul_(std * math.sqrt(2.))
+                        p.real.add_(mean)
+                        p.imag.add_(mean)
+                    else:
+                        p.uniform_(2 * l - 1, 2 * u - 1)
+                        p.erfinv_()
+                        p.mul_(std * math.sqrt(2.))
+                        p.add_(mean)
 
-    def get_pytorch_dataloaders(self):
-        train_loader = self._get_train_loader()
-        val_loader = self._get_val_loader()
-        test_loader = self._get_test_loader()
-        return train_loader, val_loader, test_loader
+    def forward(self, x):
+        x, mask = self.embedding(x)
+        scores = self.model(x, self.embedding.token.weight, mask)
+        return scores
+
+
+class LRUEmbedding(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        vocab_size = args.num_items + 1
+        embed_size = args.bert_hidden_units
+        
+        self.token = nn.Embedding(vocab_size, embed_size)
+        self.layer_norm = nn.LayerNorm(embed_size)
+        self.embed_dropout = nn.Dropout(args.bert_dropout)
+
+    def get_mask(self, x):
+        return (x > 0)
+
+    def forward(self, x):
+        mask = self.get_mask(x)
+        x = self.token(x)
+        return self.layer_norm(self.embed_dropout(x)), mask
+
+
+class LRUModel(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.hidden_size = args.bert_hidden_units
+        layers = args.bert_num_blocks
+
+        self.lru_blocks = nn.ModuleList([LRUBlock(self.args) for _ in range(layers)])
+        self.bias = torch.nn.Parameter(torch.zeros(args.num_items + 1))
+
+    def forward(self, x, embedding_weight, mask):
+        # left padding to the power of 2
+        seq_len = x.size(1)
+        log2_L = int(np.ceil(np.log2(seq_len)))
+        x = F.pad(x, (0, 0, 2 ** log2_L - x.size(1), 0, 0, 0))
+        mask_ = F.pad(mask, (2 ** log2_L - mask.size(1), 0, 0, 0))
+
+        # LRU blocks with pffn
+        for lru_block in self.lru_blocks:
+            x = lru_block.forward(x, mask_)
+        x = x[:, -seq_len:]  # B x L x D (64)
+
+        scores = torch.matmul(x, embedding_weight.permute(1, 0)) + self.bias
+        return scores
+
+
+class LRUBlock(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        hidden_size = args.bert_hidden_units
+        self.lru_layer = LRULayer(
+            d_model=hidden_size, dropout=args.bert_attn_dropout)
+        self.feed_forward = PositionwiseFeedForward(
+            d_model=hidden_size, d_ff=hidden_size*4, dropout=args.bert_dropout)
     
-    def get_pytorch_test_subset_dataloader(self):
-        retrieved_file_path = self.args.llm_retrieved_path
-        print('Loading retrieved file from {}'.format(retrieved_file_path))
-        retrieved_file = pickle.load(open(os.path.join(retrieved_file_path,
-                                                       'retrieved.pkl'), 'rb'))
-        
-        test_probs = retrieved_file['test_probs']
-        test_labels = retrieved_file['test_labels']
-        test_users = [u for u, (p, l) in enumerate(zip(test_probs, test_labels), start=1) \
-                      if l in torch.topk(torch.tensor(p), self.args.llm_negative_sample_size+1).indices]
-
-        dataset = dataset = LRUTestDataset(self.args, self.train, self.val, self.test, self.max_len, 
-                                           self.rng, subset_users=test_users)
-        dataloader = data_utils.DataLoader(dataset, batch_size=self.args.val_batch_size, shuffle=False,
-                                           pin_memory=True, num_workers=self.args.num_workers)
-        return dataloader
-
-    def _get_train_loader(self):
-        dataset = self._get_train_dataset()
-        dataloader = data_utils.DataLoader(dataset, batch_size=self.args.train_batch_size,
-                        shuffle=True, pin_memory=True, num_workers=self.args.num_workers,
-                        worker_init_fn=worker_init_fn)
-        return dataloader
-
-    def _get_train_dataset(self):
-        dataset = LRUTrainDataset(
-            self.args, self.train, self.max_len, self.sliding_size, self.rng)
-        return dataset
-
-    def _get_val_loader(self):
-        return self._get_eval_loader(mode='val')
-
-    def _get_test_loader(self):
-        return self._get_eval_loader(mode='test')
-
-    def _get_eval_loader(self, mode):
-        batch_size = self.args.val_batch_size if mode == 'val' else self.args.test_batch_size
-        dataset = self._get_eval_dataset(mode)
-        dataloader = data_utils.DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        pin_memory=True, num_workers=self.args.num_workers)
-        return dataloader
-
-    def _get_eval_dataset(self, mode):
-        if mode == 'val':
-            dataset = LRUValidDataset(self.args, self.train, self.val, self.max_len, self.rng)
-        elif mode == 'test':
-            dataset = LRUTestDataset(self.args, self.train, self.val, self.test, self.max_len, self.rng)
-        return dataset
-
-
-class LRUTrainDataset(data_utils.Dataset):
-    def __init__(self, args, u2seq, max_len, sliding_size, rng):
-        self.args = args
-        self.max_len = max_len
-        self.sliding_step = int(sliding_size * max_len)
-        self.num_items = args.num_items
-        self.rng = rng
-        
-        assert self.sliding_step > 0
-        self.all_seqs = []
-        for u in sorted(u2seq.keys()):
-            seq = u2seq[u]
-            if len(seq) < self.max_len + self.sliding_step:
-                self.all_seqs.append(seq)
-            else:
-                start_idx = range(len(seq) - max_len, -1, -self.sliding_step)
-                self.all_seqs = self.all_seqs + [seq[i:i + max_len] for i in start_idx]
-
-    def __len__(self):
-        return len(self.all_seqs)
-
-    def __getitem__(self, index):
-        seq = self.all_seqs[index]
-        labels = seq[-self.max_len:]
-        tokens = seq[:-1][-self.max_len:]
-
-        mask_len = self.max_len - len(tokens)
-        tokens = [0] * mask_len + tokens
-
-        mask_len = self.max_len - len(labels)
-        labels = [0] * mask_len + labels
-
-        return torch.LongTensor(tokens), torch.LongTensor(labels)
-
-
-class LRUValidDataset(data_utils.Dataset):
-    def __init__(self, args, u2seq, u2answer, max_len, rng):
-        self.args = args
-        self.u2seq = u2seq
-        self.u2answer = u2answer
-        users = sorted(self.u2seq.keys())
-        self.users = [u for u in users if len(u2answer[u]) > 0]
-        self.max_len = max_len
-        self.rng = rng
+    def forward(self, x, mask):
+        x = self.lru_layer(x, mask)
+        x = self.feed_forward(x)
+        return x
     
-    def __len__(self):
-        return len(self.users)
 
-    def __getitem__(self, index):
-        user = self.users[index]
-        seq = self.u2seq[user]
-        answer = self.u2answer[user]
+class LRULayer(nn.Module):
+    def __init__(self,
+                 d_model,
+                 dropout=0.1,
+                 use_bias=True,
+                 r_min=0.8,
+                 r_max=0.99):
+        super().__init__()
+        self.embed_size = d_model
+        self.hidden_size = 2 * d_model
+        self.use_bias = use_bias
 
-        seq = seq[-self.max_len:]
-        padding_len = self.max_len - len(seq)
-        seq = [0] * padding_len + seq
+        # init nu, theta, gamma
+        u1 = torch.rand(self.hidden_size)
+        u2 = torch.rand(self.hidden_size)
+        nu_log = torch.log(-0.5 * torch.log(u1 * (r_max ** 2 - r_min ** 2) + r_min ** 2))
+        theta_log = torch.log(u2 * torch.tensor(np.pi) * 2)
+        diag_lambda = torch.exp(torch.complex(-torch.exp(nu_log), torch.exp(theta_log)))
+        gamma_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda) ** 2))
+        self.params_log = nn.Parameter(torch.vstack((nu_log, theta_log, gamma_log)))
 
-        return torch.LongTensor(seq), torch.LongTensor(answer)
-
-
-class LRUTestDataset(data_utils.Dataset):
-    def __init__(self, args, u2seq, u2val, u2answer, max_len, rng, subset_users=None):
-        self.args = args
-        self.u2seq = u2seq
-        self.u2val = u2val
-        self.u2answer = u2answer
-        users = sorted(self.u2seq.keys())
-        self.users = [u for u in users if len(u2val[u]) > 0 and len(u2answer[u]) > 0]
-        self.max_len = max_len
-        self.rng = rng
+        # Init B, C, D
+        self.in_proj = nn.Linear(self.embed_size, self.hidden_size, bias=use_bias).to(torch.cfloat)
+        self.out_proj = nn.Linear(self.hidden_size, self.embed_size, bias=use_bias).to(torch.cfloat)
+        # self.out_vector = nn.Parameter(torch.rand(self.embed_size))
+        self.out_vector = nn.Identity()
         
-        if subset_users is not None:
-            self.users = subset_users
+        # Dropout and layer norm
+        self.dropout = nn.Dropout(p=dropout)
+        self.layer_norm = nn.LayerNorm(self.embed_size)
 
-    def __len__(self):
-        return len(self.users)
+    def lru_parallel(self, i, h, lamb, mask, B, L, D):
+        # Parallel algorithm, see: https://kexue.fm/archives/9554#%E5%B9%B6%E8%A1%8C%E5%8C%96
+        # The original implementation is slightly slower and does not consider 0 padding
+        l = 2 ** i
+        h = h.reshape(B * L // l, l, D)  # (B, L, D) -> (B * L // 2, 2, D)
+        mask_ = mask.reshape(B * L // l, l)  # (B, L) -> (B * L // 2, 2)
+        h1, h2 = h[:, :l // 2], h[:, l // 2:]  # Divide data in half
 
-    def __getitem__(self, index):
-        user = self.users[index]
-        seq = self.u2seq[user] + self.u2val[user]
-        answer = self.u2answer[user]
+        if i > 1: lamb = torch.cat((lamb, lamb * lamb[-1]), 0)
+        h2 = h2 + lamb * h1[:, -1:] * mask_[:, l // 2 - 1:l // 2].unsqueeze(-1)
+        h = torch.cat([h1, h2], axis=1)
+        return h, lamb
 
-        seq = seq[-self.max_len:]
-        padding_len = self.max_len - len(seq)
-        seq = [0] * padding_len + seq
+    def forward(self, x, mask):
+        # compute bu and lambda
+        nu, theta, gamma = torch.exp(self.params_log).split((1, 1, 1))
+        lamb = torch.exp(torch.complex(-nu, theta))
+        h = self.in_proj(x.to(torch.cfloat)) * gamma  # bu
+        
+        # compute h in parallel
+        log2_L = int(np.ceil(np.log2(h.size(1))))
+        B, L, D = h.size(0), h.size(1), h.size(2)
+        for i in range(log2_L):
+            h, lamb = self.lru_parallel(i + 1, h, lamb, mask, B, L, D)
+        x = self.dropout(self.out_proj(h).real) + self.out_vector(x)
+        return self.layer_norm(x)  # residual connection introduced above 
+    
 
-        return torch.LongTensor(seq), torch.LongTensor(answer)
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        x_ = self.dropout(self.activation(self.w_1(x)))
+        return self.layer_norm(self.dropout(self.w_2(x_)) + x)
