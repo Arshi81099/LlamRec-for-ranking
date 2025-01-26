@@ -1,45 +1,29 @@
-import json
-import os.path as osp
-from typing import Union
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import urllib.request
 
 
-class Prompter(object):
-    __slots__ = ("template", "_verbose")
+from pathlib import Path
+import zipfile
+import tarfile
+import sys
 
-    def __init__(self, template_name: str = "", verbose: bool = False):
-        self._verbose = verbose
-        if not template_name:
-            # template_name = "alpaca"
-            template_name = "alpaca_short"
-        file_name = osp.join("dataloader", "templates", f"{template_name}.json")
-        if not osp.exists(file_name):
-            raise ValueError(f"Can't read {file_name}")
-        with open(file_name) as fp:
-            self.template = json.load(fp)
-        if self._verbose:
-            print(
-                f"Using prompt template {template_name}: {self.template['description']}"
-            )
 
-    def generate_prompt(
-        self,
-        instruction: str,
-        input: Union[None, str] = None,
-        label: Union[None, str] = None,
-    ) -> str:
-        if input:
-            res = self.template["prompt_input"].format(
-                instruction=instruction, input=input
-            )
-        else:
-            res = self.template["prompt_no_input"].format(
-                instruction=instruction
-            )
-        if label:
-            res = f"{res}{label}"
-        if self._verbose:
-            print(res)
-        return res
+def download(url, savepath):
+    urllib.request.urlretrieve(url, str(savepath))
+    print()
 
-    def get_response(self, output: str) -> str:
-        return output.split(self.template["response_split"])[1].strip()
+
+def unzip(zippath, savepath):
+    print("Extracting data...")
+    zip = zipfile.ZipFile(zippath)
+    zip.extractall(savepath)
+    zip.close()
+
+
+def unziptargz(zippath, savepath):
+    print("Extracting data...")
+    f = tarfile.open(zippath)
+    f.extractall(savepath)
+    f.close()
