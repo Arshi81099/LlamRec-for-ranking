@@ -30,7 +30,7 @@ Please specify PATH_TO_RETRIEVER with the retriever path from the previous step.
 
 The table below reports our main performance results, with best results marked in bold and second best results underlined. For training and evaluation details, please refer to our paper.
 
-<img src=media/performance.png width=1000>
+<img src=performance.png width=1000>
 
 
 ## Citation
